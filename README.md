@@ -17,3 +17,6 @@ This approach provides:
 - Localized control of reconstruction
 - Fine-grained error diagnostics
 - Patch-level feature analysis (variance, edge content, latent space, etc.)
+
+Example with default parameters:
+![Denoising Example](denoising_default_example.png)

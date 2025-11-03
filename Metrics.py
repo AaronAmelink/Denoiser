@@ -20,7 +20,7 @@ def overlay_error_heatmap(model, dataset, recon_full, target_image_id, metric='m
     model.eval()
     with torch.no_grad():
         for i in range(len(dataset)):
-            patch, noised, img_id = dataset[i]
+            patch, noised, img_id, top, left = dataset[i]
             if img_id != target_image_id:
                 continue
 
@@ -35,7 +35,6 @@ def overlay_error_heatmap(model, dataset, recon_full, target_image_id, metric='m
             else:
                 raise ValueError("Unsupported metric. Use 'mse' or 'ssim'.")
 
-            _, top, left = dataset.locations[i]
             error_map[top:top + patch_size, left:left + patch_size] += error
             count_map[top:top + patch_size, left:left + patch_size] += 1
 
@@ -62,7 +61,7 @@ def patchwise_errors(model, device, dataset):
 
     with torch.no_grad():
         for i in range(max(len(dataset), 500)):
-            clean, noisy, _ = dataset[i]
+            clean, noisy, image_id, top, left = dataset[i]
             clean = clean.unsqueeze(0).to(device)
             noisy = noisy.unsqueeze(0).to(device)
 
@@ -113,12 +112,10 @@ def patch_error_vs_content(model, device, dataset, content_func):
 
     model.eval()
     with torch.no_grad():
-        for clean, noisy, _ in dataset:
+        for clean, noisy, image_id, top, left in dataset:
             clean = clean.to(device)
-            noisy = noisy.to(device).unsqueeze(0)  # add batch dim
-
-            denoised = model(noisy)
-            denoised = denoised.squeeze(0)  # remove batch dim
+            noisy = noisy.to(device).unsqueeze(0)
+            denoised = model(noisy).squeeze(0)
 
             error = F.mse_loss(denoised, clean, reduction='mean').cpu().item()
             content = content_func(clean.cpu())  # ensure CPU tensor or numpy
@@ -150,7 +147,7 @@ def extract_latent_vectors(model, device, dataset, max_samples=1000, batch_size=
     with torch.no_grad():
         total_samples = 0
         for batch in loader:
-            patch, noisy, _ = batch
+            patch, noisy, image_id, top, left = batch  # unpack 5 values
             noisy = noisy.to(device)
             latent = model.encoder(noisy)
             latent_flat = latent.reshape(latent.size(0), -1).cpu().numpy()

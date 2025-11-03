@@ -15,13 +15,13 @@ from scipy.stats import multivariate_normal
 from Metrics import overlay_error_heatmap, patchwise_errors, patch_error_vs_content, patch_content_variance, patch_content_edge, extract_latent_vectors, plot_tsne_umap
 
 BATCH_SIZE = 64
-EPOCHS = 1
+EPOCHS = 5
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 LOG_INTERVAL = 10
 LEARNING_RATE = 1e-3
-PATCH_SIZE = 16
+PATCH_SIZE = 32
 STRIDE = 8
-NOISE_FACTOR = 0.15
+NOISE_FACTOR = 0.05
 TITLE = f"PATCH {PATCH_SIZE}, STRIDE {STRIDE}"
 SUBTITLE = f"NOISE FACTOR {NOISE_FACTOR}, EPOCHS {EPOCHS}"
 
@@ -49,7 +49,7 @@ def run_all_diagnostics(model, device, test_dataset, test_loader, patch_size=PAT
             noised = noised.unsqueeze(0).to(device)
             output = model(noised)
             patches.append(output.cpu().squeeze(0))
-        recon_full = test_dataset.reconstruct_image(patches, target_image_id)
+        recon_full = test_dataset.reconstruct_image_from_list(patches, target_image_id)
 
     overlay_error_heatmap(model, test_dataset, recon_full, target_image_id,
                           metric='mse', patch_size=patch_size, device=device)
@@ -69,19 +69,20 @@ def run_all_diagnostics(model, device, test_dataset, test_loader, patch_size=PAT
     print("Plotting UMAP of latent space...")
     plot_tsne_umap(latents, method='umap')
 
-
+# ---- Replace PatchDataset class with this improved version ----
 class PatchDataset(Dataset):
-    def __init__(self, root_dir, patch_size=32, stride=None, image_ids=None):
+    def __init__(self, root_dir, patch_size=32, stride=None, image_ids=None, noise_factor=NOISE_FACTOR):
         self.root_dir = root_dir
         self.patch_size = patch_size
         self.stride = stride if stride is not None else patch_size  # default no overlap
         self.to_tensor = T.ToTensor()
         self.resize = T.Resize((256,256))
         self.transform = add_noise
-        self.patches = []
-        self.locations = []  # (image_id_in_dataset, top, left)
-        self.image_info = []
-        self.weight_mask = self._gaussian_weight_mask(self.patch_size).unsqueeze(0)  # shape [1, H, W]
+        self.patches = []            # list of PIL.Image or patch images
+        self.locations = []          # list of tuples: (img_idx_in_dataset, top, left)
+        self.image_info = []         # list of (filename, w, h) per image_idx_in_dataset
+        self.weight_mask = self._gaussian_weight_mask(self.patch_size).unsqueeze(0)  # [1, H, W]
+        self.noise_factor = noise_factor
 
         self._prepare_patches(image_ids)
 
@@ -100,11 +101,11 @@ class PatchDataset(Dataset):
             img = Image.open(path).convert('RGB')
             w, h = img.size
             if self.patch_size is not None and (w < self.patch_size or h < self.patch_size):
-                continue  # Skip small images
+                # skip too-small images
+                continue
 
             self.image_info.append((filename, w, h))
 
-            # Sliding window with stride smaller than patch size for overlap
             if self.patch_size:
                 for top in range(0, h - self.patch_size + 1, self.stride):
                     for left in range(0, w - self.patch_size + 1, self.stride):
@@ -112,15 +113,16 @@ class PatchDataset(Dataset):
                         self.patches.append(patch)
                         self.locations.append((idx_in_dataset, top, left))
             else:
+                # no patching, full images
                 self.patches.append(img)
-                self.locations.append(((idx_in_dataset, 0, 0)))
-                
+                self.locations.append((idx_in_dataset, 0, 0))
+
     def _gaussian_weight_mask(self, size):
 
         x, y = np.mgrid[0:size, 0:size]
         pos = np.dstack((x, y))
         mu = [size // 2, size // 2]
-        sigma = [size / 4, size / 4]  # Adjust to control how soft the edges are
+        sigma = [size / 8, size / 8]  # Adjust to control how soft the edges are
         rv = multivariate_normal(mean=mu, cov=[[sigma[0]**2, 0], [0, sigma[1]**2]])
         mask = rv.pdf(pos)
         mask = mask / mask.max()  # Normalize to 1.0
@@ -130,35 +132,37 @@ class PatchDataset(Dataset):
         return len(self.patches)
 
     def __getitem__(self, idx):
-        patch = self.patches[idx]
-        if (self.patch_size == None):
-            patch = self.resize(patch)  # Ensure consistent size before stacking
-        patch = self.to_tensor(patch)
-        noised = self.transform(patch)
-        image_id, top, left = self.locations[idx]
-        return patch, noised, image_id
-
-    def reconstruct_image(self, recon_patches, image_id):
+        patch_pil = self.patches[idx]
         if self.patch_size is None:
-            return recon_patches[0]  # No patching used
+            patch_pil = self.resize(patch_pil)
+        patch = self.to_tensor(patch_pil)           # clean
+        noised = self.transform(patch, self.noise_factor)              # noisy input
+        image_id, top, left = self.locations[idx]
+        # return coordinates so reconstruction can use them unambiguously
+        return patch, noised, image_id, top, left
 
+    def reconstruct_image_from_list(self, recon_patch_list, image_id):
+        """
+        recon_patch_list: list of tuples (top, left, patch_tensor)
+        image_id: index within this dataset's image_info to reconstruct
+
+        This method reconstructs using the coordinates provided in recon_patch_list,
+        so it avoids any assumptions about ordering.
+        """
         filename, w, h = self.image_info[image_id]
-        num_channels = recon_patches[0].shape[0]
+        num_channels = recon_patch_list[0][2].shape[0]
         full_img = torch.zeros((num_channels, h, w), dtype=torch.float32)
         count_img = torch.zeros((num_channels, h, w), dtype=torch.float32)
 
-        # Move weight mask to device only once
-        weight = self.weight_mask.to(recon_patches[0].device)  # [1, H, W]
-
-        for i, (img_id, top, left) in enumerate(self.locations):
-            if img_id != image_id:
-                continue
-
-            patch = recon_patches[i] * weight  # Apply Gaussian weight mask
-            full_img[:, top:top + self.patch_size, left:left + self.patch_size] += patch
+        weight = self.weight_mask.to(full_img.device)  # shape [1, H, W]
+        # apply each provided patch using its coordinates
+        for (top, left, patch_tensor) in recon_patch_list:
+            # ensure patch_tensor on same device as weight
+            p = patch_tensor * weight  # broadcasting over channels
+            full_img[:, top:top + self.patch_size, left:left + self.patch_size] += p
             count_img[:, top:top + self.patch_size, left:left + self.patch_size] += weight
 
-        count_img[count_img == 0] = 1  # Avoid division by zero
+        count_img[count_img == 0] = 1.0
         return full_img / count_img
 
 
@@ -194,11 +198,16 @@ class DenoisingAutoencoder(nn.Module):
 
 def train(model, device, train_loader, optimizer, epoch):
     model.train()
-    for batch_idx, (data, target, _) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
+    for batch_idx, batch in enumerate(train_loader):
+        # batch is (data, target, image_id, top, left)
+        data, target = batch[0].to(device), batch[1].to(device)
+        # rest are coords if you need them: image_id, top, left = batch[2], batch[3], batch[4]
         optimizer.zero_grad()
-        output = model(target)  # target is noisy input, data is clean
-        ssim_value = ssim(output, data, data_range=1.0)  # images are in [0, 1]
+        output = model(target)
+        # ensure ssim is scalar
+        ssim_value = ssim(output, data, data_range=1.0)
+        if isinstance(ssim_value, torch.Tensor):
+            ssim_value = ssim_value.mean()
         loss = 0.8 * F.mse_loss(output, data) + 0.2 * (1 - ssim_value)
         loss.backward()
         optimizer.step()
@@ -212,10 +221,12 @@ def test(model, device, test_loader):
     model.eval()
     test_loss = 0
     with torch.no_grad():
-        for (batch_idx, (data, target, _)) in enumerate(test_loader):
-            data, target = data.to(device), target.to(device)
+        for batch_idx, batch in enumerate(test_loader):
+            data, target = batch[0].to(device), batch[1].to(device)
             output = model(target)
             ssim_value = ssim(output, data, data_range=1.0)  # images are in [0, 1]
+            if isinstance(ssim_value, torch.Tensor):
+                ssim_value = ssim_value.mean()
             test_loss += 0.8 * F.mse_loss(output, data) + 0.2 * (1 - ssim_value)
             if batch_idx % LOG_INTERVAL == 0:
                 print('Test Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -238,12 +249,12 @@ def main():
     indices = np.arange(num_images)
     np.random.shuffle(indices)
     train_img_ids = indices[:int(0.8 * num_images)]
-    test_img_ids = indices[int(0.8 * num_images):int(0.805 * num_images)]
+    test_img_ids = indices[int(0.8 * num_images):]
 
     print(f"Total images: {num_images}, train: {len(train_img_ids)}, test: {len(test_img_ids)}")
 
     train_dataset = PatchDataset(root_dir, patch_size=PATCH_SIZE, stride=STRIDE, image_ids=train_img_ids)
-    test_dataset = PatchDataset(root_dir, patch_size=PATCH_SIZE, stride=STRIDE, image_ids=test_img_ids)
+    test_dataset = PatchDataset(root_dir, patch_size=PATCH_SIZE, stride=STRIDE, image_ids=test_img_ids, noise_factor=0.15)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -256,6 +267,8 @@ def main():
     
     scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
     for epoch in range(1, EPOCHS + 1):
+        train_loader.dataset.noise_factor = NOISE_FACTOR * (1 + 0.3 * epoch)  # increase noise over epochs by 30% each epoch
+        print(f"Starting epoch {epoch} with noise factor {train_loader.dataset.noise_factor}")
         train(model, DEVICE, train_loader, optimizer, epoch)
         print(f"Epoch {epoch} complete. Testing model...")
         AVERAGE_LOSS = test(model, DEVICE, test_loader)
@@ -267,28 +280,28 @@ def main():
     model.eval()
     with torch.no_grad():
         target_image_id = test_dataset.locations[0][0]  # Gets the first valid image_id
-        patches = []
-        noised_patches = []
-        reconstructed_patches = []
+        # collect patches (no need to keep others)
+        recon_patch_list = []
+        orig_patch_list = []
+        noised_patch_list = []
 
-        # Iterate all patches in test dataset to get patches from image_id_to_recon
         for i in range(len(test_dataset)):
-            patch, noised, img_id = test_dataset[i]
+            patch, noised, img_id, top, left = test_dataset[i]
             if img_id != target_image_id:
                 continue
-            patch = patch.unsqueeze(0).to(DEVICE)
-            noised = noised.unsqueeze(0).to(DEVICE)
+            patch_t = patch.to(DEVICE).unsqueeze(0)    # if you want full-batch inference you can stack, but keep simple
+            noised_t = noised.to(DEVICE).unsqueeze(0)
+            out = model(noised_t).cpu().squeeze(0)   # result on CPU, shape [C,H,W]
 
-            output = model(noised)
+            recon_patch_list.append((top, left, out))
+            orig_patch_list.append((top, left, patch))
+            noised_patch_list.append((top, left, noised))
 
-            patches.append(patch.cpu().squeeze(0))
-            noised_patches.append(noised.cpu().squeeze(0))
-            reconstructed_patches.append(output.cpu().squeeze(0))
-            
-        # Reconstruct full images from patches
-        original_full = test_dataset.reconstruct_image(patches, image_id=target_image_id)
-        noised_full = test_dataset.reconstruct_image(noised_patches, image_id=target_image_id)
-        recon_full = test_dataset.reconstruct_image(reconstructed_patches, image_id=target_image_id)
+        # reconstruct:
+        original_full = test_dataset.reconstruct_image_from_list(orig_patch_list, image_id=target_image_id)
+        noised_full   = test_dataset.reconstruct_image_from_list(noised_patch_list, image_id=target_image_id)
+        recon_full    = test_dataset.reconstruct_image_from_list(recon_patch_list, image_id=target_image_id)
+
 
         # Convert to [H, W, 3] for plotting
         orig_np = original_full.permute(1, 2, 0).numpy()
