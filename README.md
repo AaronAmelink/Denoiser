@@ -19,4 +19,4 @@ This approach provides:
 - Patch-level feature analysis (variance, edge content, latent space, etc.)
 
 Example with default parameters:
-![Denoising Example](denoising_default_example.png)
+![Denoising example](https://github.com/AaronAmelink/Denoiser/blob/2b9019a5eddc36d3325348e7cdd4dd145f5b7bd3/denoising_default_example.PNG)
