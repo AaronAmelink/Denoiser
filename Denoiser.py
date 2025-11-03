@@ -43,7 +43,7 @@ def run_all_diagnostics(model, device, test_dataset, test_loader, patch_size=PAT
         # reconstruct image from patches for heatmap overlay
         patches = []
         for i in range(len(test_dataset)):
-            patch, noised, img_id = test_dataset[i]
+            patch, noised, img_id, top, left = test_dataset[i]
             if img_id != target_image_id:
                 continue
             noised = noised.unsqueeze(0).to(device)
